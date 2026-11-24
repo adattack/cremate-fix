@@ -299,9 +299,19 @@ export class DshApplicationPort implements ApplicationPort {
 
   transcript(): readonly DshTranscriptItem[] { return structuredClone(this.items); }
 
-  /** Every authoritative host update advances revision, even an ordinal/cache-only update. */
+  /**
+   * Adopt one projection of the live surface.
+   *
+   * The caller hands over a FRESH array it just built (`surfaceTranscript`
+   * returns a new array of new items on every fold it does not reuse), so the
+   * items are taken as given: they are never mutated, and every replacement is
+   * a whole new array. This used to deep-clone the lot, which cost ~5 ms per
+   * call on a 1,700-node session — several times a step — to protect objects
+   * that were already private to this port. The array is copied so a caller
+   * that later reuses its own reference cannot reach in and reorder us.
+   */
   setTranscript(items: readonly DshTranscriptItem[]): void {
-    this.items = structuredClone([...items]);
+    this.items = items.slice();
     this.generation += 1;
   }
 

@@ -828,6 +828,24 @@ export interface RacoonsSessionEntry {
    */
   entryWindows: number;
   pruneWindows: number;
+  /**
+   * The surface fold's carry, so a boundary re-reads only the log it has not
+   * read yet (see `surfaceTranscript`).
+   *
+   * `upto` is how many log positions the fold has consumed; everything below
+   * it is final because a dsh log is append-only. `ordinalAt`, `stepAt` and
+   * `calls` are the fold's own tables carried across calls, and `projected`
+   * holds the finished transcript item per surface position, keyed by seq.
+   *
+   * The projection cache is what makes this worth carrying: on a 1,700-node
+   * session the log walk is 14% of the fold and `TextEncoder.encode` of every
+   * message body is the other 86%, so re-deriving an ITEM that cannot have
+   * changed is the expensive half. A node is re-derived when it is new, when
+   * its own event is replaced, or when the mount's observed `calls` map grew a
+   * fact the item records. A `beforeSeq` cut and a differing session id bypass
+   * the carry entirely: both describe a different projection, not a later one.
+   */
+  surfaceCarry: SurfaceCarry;
   /** True when a compaction landed inside an open window and owes its re-arm. */
   compactionRearmDeferred: boolean;
   /**
@@ -1598,10 +1616,58 @@ function inheritedOrdinal(event: DshMountEvent,
  * appending the result it is handed, so the snapshot it plans against must be
  * the surface prefix that precedes that result — not the surface minus it.
  */
+/**
+ * The fold's carry across calls (see `RacoonsSessionEntry.surfaceCarry`).
+ *
+ * A dsh log is append-only and its seq numbers only grow, so everything below
+ * `upto` folds to the same answer forever. Carrying the three tables and the
+ * finished items lets one boundary read the new tail instead of the whole log.
+ * A mount that does not keep it (a rig, a one-off projection) simply drops it:
+ * every field defaults to empty and the fold is a cold one.
+ */
+export interface SurfaceCarry {
+  /** How many log positions the fold has consumed; everything below is final. */
+  upto: number;
+  /** Seq -> the ordinal that position carries. */
+  ordinalAt: Map<number, { turn: number; step: number }>;
+  /** `turn:step` -> the global step ordinal that pair was given. */
+  stepAt: Map<string, number>;
+  /** `callId` -> the `tool/call` facts the log stated for it. */
+  calls: Map<string, CallFacts>;
+  /**
+   * Surface position -> the finished item, and the call facts it was built
+   * with. Re-deriving an unchanged item is the expensive half of the fold
+   * (`TextEncoder.encode` of every body), so it is done once.
+   */
+  projected: Map<number, { readonly item: DshTranscriptItem; readonly callKey: string }>;
+  /** The running ordinals the walk carries, which a resumption must restore. */
+  turn: number;
+  globalStep: number;
+  completedThrough: number;
+  lastKey: string | null;
+}
+
+/** An empty carry: a cold fold. */
+export function createSurfaceCarry(): SurfaceCarry {
+  return { upto: 0, ordinalAt: new Map(), stepAt: new Map(), calls: new Map(),
+    projected: new Map(), turn: 0, globalStep: 0, completedThrough: -1, lastKey: null };
+}
+
+/**
+ * The surface fold: one transcript item per surface position.
+ *
+ * `carry` makes it incremental. Everything below `carry.upto` was folded by an
+ * earlier call and a dsh log never rewrites a position, so only the tail
+ * `[carry.upto, session.seq)` is walked, and a surface position already in
+ * `carry.projected` is reused verbatim when neither its event nor the call
+ * facts it was built with changed. A caller that passes no carry gets a cold
+ * fold, which is what a one-off projection wants.
+ */
 export function surfaceTranscript(session: DshMountSession, options: {
   beforeSeq?: number;
   sessionId?: string;
   calls?: ReadonlyMap<string, CallFacts>;
+  carry?: SurfaceCarry;
 } = {}): {
   items: DshTranscriptItem[];
   seqs: number[];
@@ -1612,22 +1678,33 @@ export function surfaceTranscript(session: DshMountSession, options: {
   const beforeSeq = options.beforeSeq ?? Number.POSITIVE_INFINITY;
   const sessionId = options.sessionId ?? session.id;
   const length = typeof session.seq === 'number' ? session.seq : 0;
-  const ordinalAt = new Map<number, { turn: number; step: number }>();
+  // A cut describes a PREFIX of the surface, so its projection is not the one
+  // the carry holds for the whole; a carry is only reused for the full surface.
+  const carry = beforeSeq === Number.POSITIVE_INFINITY ? options.carry : undefined;
+  const ordinalAt = carry?.ordinalAt ?? new Map<number, { turn: number; step: number }>();
   // The fold's own one-pair-one-ordinal table, so a node that names its own
   // (turn, step) is stamped from its CONTENT and never from the seq the host
   // published it at (ISSUE-064: a replace lands at a later seq).
-  const stepAt = new Map<string, number>();
+  const stepAt = carry?.stepAt ?? new Map<string, number>();
   // The `tool/call` facts the log itself states, by call id. A `tool/result`
   // never repeats its call's name or arguments, so a fold that read only the
   // result would carry no target and no evidence (ISSUE-053). The mount's own
   // `observe` map wins where it has an entry: it is the same host event, read
   // once, and a caller that drove `observe` should see what it captured.
-  const loggedCalls = new Map<string, CallFacts>();
-  let turn = 0;
-  let globalStep = 0;
-  let completedThrough = -1;
-  let lastKey: string | null = null;
-  for (let seq = 0; seq < length; seq += 1) {
+  const loggedCalls = carry?.calls ?? new Map<string, CallFacts>();
+  let turn = carry?.turn ?? 0;
+  let globalStep = carry?.globalStep ?? 0;
+  let completedThrough = carry?.completedThrough ?? -1;
+  let lastKey: string | null = carry?.lastKey ?? null;
+  // Everything below the carry's high-water mark is already folded. A log that
+  // SHRANK (a host that rebuilt a session) is not resumable, so the walk starts
+  // over rather than reading a stale prefix.
+  const startSeq = carry !== undefined && carry.upto <= length ? carry.upto : 0;
+  if (startSeq === 0 && carry !== undefined) {
+    ordinalAt.clear(); stepAt.clear(); carry.projected.clear();
+    turn = 0; globalStep = 0; completedThrough = -1; lastKey = null;
+  }
+  for (let seq = startSeq; seq < length; seq += 1) {
     const event = session.eventAt?.(seq);
     if (event === undefined) continue;
     const data = isRecord(event.data) ? event.data : {};
@@ -1649,9 +1726,29 @@ export function surfaceTranscript(session: DshMountSession, options: {
     ordinalAt.set(seq, ownOrdinal(event, stepAt) ?? inheritedOrdinal(event, ordinalAt)
       ?? { turn, step: globalStep });
   }
+  // The carry now covers the whole grown log; the tables above are final below it.
+  if (carry !== undefined) Object.assign(carry, { upto: length, turn, globalStep, completedThrough, lastKey });
   const nodes = Array.isArray(session.surface?.nodes) ? session.surface.nodes : [];
   const items: DshTranscriptItem[] = [];
   const seqs: number[] = [];
+  const projected = carry?.projected;
+  /** The call facts an item is built from, as one comparable key. */
+  const callKeyOf = (call: CallFacts | null | undefined): string => call === undefined || call === null
+    ? '' : `${call.name}\u0000${JSON.stringify(call.arguments ?? null)}`;
+  /**
+   * One finished item for a surface position, reused when the carry already
+   * holds it AND neither the event nor the call facts moved. The expensive
+   * half of the fold is encoding every body, so an unchanged node is never
+   * encoded twice.
+   */
+  const project = (seq: number, event: DshMountEvent, call: CallFacts | null,
+    callKey: string, at: { turn: number; step: number }): DshTranscriptItem | null => {
+    const cached = projected?.get(seq);
+    if (cached !== undefined && cached.callKey === callKey) return cached.item;
+    const built = buildSurfaceItem({ seq, event, call, sessionId, turnOrdinal: at.turn, stepOrdinal: at.step });
+    if (built !== null) projected?.set(seq, { item: built, callKey });
+    return built;
+  };
   for (const seq of nodes) {
     if (seq >= beforeSeq) break;
     const event = session.eventAt?.(seq);
@@ -1660,40 +1757,79 @@ export function surfaceTranscript(session: DshMountSession, options: {
     if (event.type === 'tool/result') {
       const callId = callIdOf(event);
       if (callId === null) continue;
-      const item = toolResultItem({ eventId: resultNodeId(sessionId, callId), event,
-        call: options.calls?.get(callId) ?? loggedCalls.get(callId) ?? null,
-        turnOrdinal: at.turn, stepOrdinal: at.step });
+      const call = options.calls?.get(callId) ?? loggedCalls.get(callId) ?? null;
+      const item = project(seq, event, call, `tool\u0000${callId}\u0000${callKeyOf(call)}`, at);
       if (item === null) continue;
       items.push(item);
       seqs.push(seq);
       continue;
     }
-    const role = event.type === 'user/message' ? 'user'
-      : event.type === 'system/message' ? 'system'
-        : event.type === 'developer/message' ? 'developer'
-          : event.type === 'assistant/message' ? 'assistant' : null;
+    const role = messageRoleOf(event.type);
     if (role === null) continue;
-    const data = isRecord(event.data) ? event.data : {};
-    const message = role === 'user' ? data
-      : isRecord(data['message']) ? data['message'] : {};
-    const content = message['content'];
-    const toolCallIds = Array.isArray(content)
-      ? content.filter((block) => isRecord(block) && block['type'] === 'tool-call'
-        && typeof block['id'] === 'string').map((block) => block['id'] as string) : [];
-    // The host's declared source kind is carried, not discarded (ADR-0037
-    // decision 5; ISSUE-149). A message that declares none keeps the key absent:
-    // "the host said nothing" and "the host declared user" are different facts,
-    // and core refuses to read the second into the first.
-    const provenance = provenanceOf(message);
-    items.push({ id: `dsh:${sessionId}:message:${String(seq)}`, role,
-      bytes: new TextEncoder().encode(textOf(content)),
-      turnOrdinal: at.turn, stepOrdinal: at.step,
-      ...toolCallIds.length > 0 ? { toolCallIds } : {},
-      ...provenance === null ? {} : { provenance } });
+    // A message carries no call facts of its own: its key names the event type
+    // and the position, so a replaced event re-derives and an untouched one is
+    // reused.
+    const item = project(seq, event, null, `msg\u0000${event.type}`, at);
+    if (item === null) continue;
+    items.push(item);
     seqs.push(seq);
   }
   return { items, seqs, currentTurnOrdinal: turn, currentStepOrdinal: globalStep,
     completedThroughTurnOrdinal: Math.min(completedThrough, turn) };
+}
+
+/** The MESSAGE role one host event type publishes, or null when it publishes none. */
+function messageRoleOf(type: string): 'user' | 'system' | 'developer' | 'assistant' | null {
+  return type === 'user/message' ? 'user'
+    : type === 'system/message' ? 'system'
+      : type === 'developer/message' ? 'developer'
+        : type === 'assistant/message' ? 'assistant' : null;
+}
+
+/**
+ * One surface position's transcript item, built from its host event.
+ *
+ * Split out of the fold so the fold can cache the RESULT (see
+ * `SurfaceCarry.projected`): re-encoding an unchanged body is the expensive
+ * half of a re-read, and a boundary re-reads the surface several times a step.
+ * The rules are unchanged from the inline version this replaced.
+ */
+function buildSurfaceItem(params: {
+  readonly seq: number;
+  readonly event: DshMountEvent;
+  readonly call: CallFacts | null;
+  readonly sessionId: string;
+  readonly turnOrdinal: number;
+  readonly stepOrdinal: number;
+}): DshTranscriptItem | null {
+  const { seq, event, sessionId, turnOrdinal, stepOrdinal } = params;
+  if (event.type === 'tool/result') {
+    const callId = callIdOf(event);
+    if (callId === null) return null;
+    return toolResultItem({ eventId: resultNodeId(sessionId, callId), event,
+      call: params.call, turnOrdinal, stepOrdinal });
+  }
+  const role = messageRoleOf(event.type);
+  if (role === null) return null;
+  const data = isRecord(event.data) ? event.data : {};
+  // Narrowed by `role`: a message item carries no record id, so the union above
+  // cannot pick `DshRecordItem` here.
+  const message = role === 'user' ? data
+    : isRecord(data['message']) ? data['message'] : {};
+  const content = message['content'];
+  const toolCallIds = Array.isArray(content)
+    ? content.filter((block) => isRecord(block) && block['type'] === 'tool-call'
+      && typeof block['id'] === 'string').map((block) => block['id'] as string) : [];
+  // The host's declared source kind is carried, not discarded (ADR-0037
+  // decision 5; ISSUE-149). A message that declares none keeps the key absent:
+  // "the host said nothing" and "the host declared user" are different facts,
+  // and core refuses to read the second into the first.
+  const provenance = provenanceOf(message);
+  return { id: `dsh:${sessionId}:message:${String(seq)}`, role,
+    bytes: new TextEncoder().encode(textOf(content)),
+    turnOrdinal, stepOrdinal,
+    ...toolCallIds.length > 0 ? { toolCallIds } : {},
+    ...provenance === null ? {} : { provenance } };
 }
 
 /** The journal fields one published application records. */
@@ -2906,6 +3042,7 @@ export function createRacoonsMount(options: {
         ? (openingRoute?.model ?? null) : null,
       billedPromptTokens: null,
       entryJudged: new Set<string>(), entryKept: new Set<string>(),
+      surfaceCarry: createSurfaceCarry(),
       // ISSUE-406: the first-ask flag is a claim about THIS session's ask
       // history, so a restart restores it from the same durable file the round
       // and latch ride. A fork starts false: the parent's history is not its.
@@ -2964,6 +3101,11 @@ export function createRacoonsMount(options: {
       ...syncOptions.beforeSeq === undefined ? {} : { beforeSeq: syncOptions.beforeSeq },
       sessionId: entry.sessionId,
       ...callFacts === undefined ? {} : { calls: callFacts },
+      // The entry's carry makes this a tail read: only the log positions this
+      // session has not folded yet are walked, and an unchanged surface item is
+      // reused instead of re-encoded. A `beforeSeq` cut ignores the carry (see
+      // `surfaceTranscript`).
+      carry: entry.surfaceCarry,
     });
     entry.port.setTranscript(synced.items);
     const completedThrough = syncOptions.completedThroughTurnOrdinal
@@ -5073,10 +5215,14 @@ export function createRacoonsMount(options: {
     // step yet, so a result's unit is asked once before any later seam can name
     // it. Sequential, one ask per result, and fail-open throughout: the step is
     // never held past the ask's own deadline.
+    // An answered exchange appended turns and may have rewound them, so the
+    // at-rest pass must plan against the surface that actually stands now — but
+    // only when the ask loop was entered: with nothing landed it cannot have
+    // written anything, and the sync above already covers the surface. The
+    // loop's own applies re-sync per row (see `askBatchCore`), so this is the
+    // batch's closing read, not its only one.
     await runEntryAsks(entry, session, landed, signal);
-    // An answered exchange appended turns and may have rewound them: the
-    // at-rest pass must plan against the surface that actually stands now.
-    syncPass(entry, session);
+    if (landed.length > 0) syncPass(entry, session);
     // Manual forgets queued by the `forget` tool apply here, before the at-rest
     // pass plans anything (ISSUE-045 chunk D2). The queue is drained once per
     // boundary: a forget is one revert, and the engine dedupes by event id, so
