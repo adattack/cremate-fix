@@ -99,6 +99,7 @@ export {
 export type {
   RacoonsStorageErrorCode, RacoonsStorageOptions, ResolvedRacoonsStorage,
 } from './storage.js';
+import { DshHostIncompatibleError, probeEvent, probeHost } from './host-compat.js';
 
 /** Stable Cordis plugin name. */
 export const CREMATOR_PLUGIN_NAME = 'cremator';
@@ -5001,6 +5002,20 @@ export function createRacoonsMount(options: {
   async function runStep(session: DshMountSession,
     ordinals: { turn: number; step: number }, signal?: AbortSignal,
     cremateMessageId?: string): Promise<StepOutcome> {
+    // The boundary's own shape check. `apply` probes the sessions the host
+    // listed then; a session that appears later, or a host that lists none, is
+    // probed here — same rule, one step later. A mismatch is thrown rather than
+    // journaled because the alternative is a mount that runs and silently
+    // removes nothing: the caller's boundary catches it, warns, and skips this
+    // step instead of feeding the fold a shape it will mis-read.
+    // An absent log position is legal (an empty session reads no events and
+    // plans nothing), so only an event that EXISTS is shape-checked.
+    const boundarySeq = typeof session.seq === 'number' ? session.seq - 1 : 0;
+    const boundaryEvent = boundarySeq >= 0 ? session.eventAt?.(boundarySeq) : undefined;
+    if (boundaryEvent !== undefined) {
+      const incompatible = probeEvent(boundaryEvent);
+      if (incompatible !== null) throw new DshHostIncompatibleError([incompatible]);
+    }
     // ISSUE-439: a mount whose install-identity write failed retries it at the
     // NEXT boundary, before any pass classifies the session (ADR-0065
     // Decision 4). The boundary that created the entry already attempted it.
@@ -6072,6 +6087,22 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
     name: CREMATOR_PLUGIN_NAME,
     inject: CREMATOR_PLUGIN_INJECT,
     async apply(ctx, rawConfig) {
+      // Refuse a host this adapter cannot read, BEFORE any ledger opens.
+      //
+      // A version range states what was tested; it does not state what the host
+      // object actually looks like today. The shape is what the fold depends on,
+      // and a mismatch used to stay invisible until a pass was refused minutes
+      // later as if the plan were at fault. Probing here turns that into one
+      // error at mount, naming the field.
+      //
+      // Only sessions the host already lists are probed. A host with no list
+      // seam is checked at each boundary instead, which is the same check one
+      // step later.
+      const preexisting = (() => {
+        try { return ctx.sessions?.list?.() ?? []; } catch { return []; }
+      })();
+      const incompatible = probeHost(preexisting as readonly unknown[]);
+      if (incompatible.length > 0) throw new DshHostIncompatibleError(incompatible);
       const config = resolvePluginConfig({ ...options.config, ...rawConfig },
         { hostModelInfo: typeof ctx.llm?.resolveModelInfo === 'function' });
       const storage = resolveStorage(options.storage, config.crematorStorageRoot);

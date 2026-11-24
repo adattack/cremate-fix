@@ -313,6 +313,12 @@ test('the package ships a dsh bundle patch that inserts the mount', () => {
   const patch = readFileSync(patchUrl, 'utf8');
   assert.match(patch, /id:\s*cremator\b/);
   assert.match(patch, /name:\s*'cremator-dsh\/plugin'/);
-  assert.match(patch, /contextWindowTokens:\s*400000/);
   assert.match(patch, /pruneThresholdTokens:\s*60000/);
+  // The shipped bundle must NOT pin a context window. The trigger's 75% skip
+  // line is a fraction of it, so a bundled number is wrong for every routed
+  // model but the one it was measured on: too small retires the trigger early,
+  // too large retires it never. Unset, the mount resolves the routed model's own
+  // window through the host seam (ADR-0071).
+  assert.doesNotMatch(patch, /^\s*contextWindowTokens:/mu,
+    'the bundle must leave the window to the host model-info seam');
 });

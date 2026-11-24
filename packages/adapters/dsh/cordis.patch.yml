@@ -6,16 +6,24 @@
 # settings form unaddressable.
 #
 # The config is the documented example, not a fixed policy: a profile patch
-# after the bundle layer can override any key. `contextWindowTokens` and
-# `pruneThresholdTokens` arm the depth-triggered table; omit both and only the
-# manual `/cremate` command runs a pass.
+# after the bundle layer can override any key. `pruneThresholdTokens` arms the
+# depth-triggered table; omit it and only the manual `/cremate` command runs a
+# pass.
+#
+# `contextWindowTokens` is deliberately NOT set here. A bundled default has to
+# be right for every user's routed model, and a hardcoded window is not: the
+# trigger's 75% skip line is derived from it, so a value smaller than the real
+# window retires the trigger early (400000 on a 1M-token model stops at 300000
+# and leaves 700000 unused), and a value larger than the real window retires it
+# never. Left unset, the mount resolves the ROUTED model's own window through
+# the host's `llm.resolveModelInfo` seam (ADR-0071) and re-resolves on a model
+# switch. A deployment that wants a fixed number sets it in its profile patch.
 - insert:
     - id: cremator
       name: 'cremator-dsh/plugin'
       config:
         barBytes: 512
         enforcement: apply
-        contextWindowTokens: 400000
         pruneThresholdTokens: 60000
         entryAskTrigger: { mode: 'off' }
         nativeCompactionBackstop: true

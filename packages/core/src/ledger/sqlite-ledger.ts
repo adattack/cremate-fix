@@ -131,9 +131,44 @@ export class SqliteLedger implements Ledger {
     } catch (error) { throw storageError(error, "Cannot hydrate ledger archive"); }
   }
 
+  /**
+   * Fold the write-ahead log back into the database file.
+   *
+   * WAL mode keeps committed pages in `<database>-wal` until SQLite decides to
+   * checkpoint. Until then `ledger.sqlite` alone is an EMPTY shell: a backup,
+   * an archive copy or a move between machines that takes only the main file
+   * reads "no such table" and every recall id minted by this session answers
+   * not-found — silently, because nothing is missing from the ledger's own
+   * point of view. So a caller that is about to copy the file out (a backup
+   * job, an operator, `close`) checkpoints first.
+   *
+   * `TRUNCATE` also empties the WAL, so the file that is left behind is
+   * self-contained. It is a no-op in DELETE mode and waits at most
+   * `busy_timeout` for a competing connection.
+   *
+   * Deliberately NOT fatal: a checkpoint is housekeeping, so a refusal here
+   * (a reader holding the WAL, a read-only mount) must never fail the caller.
+   * It answers whether the fold actually completed.
+   */
+  checkpoint(): boolean {
+    if (this.#closed) return false;
+    try {
+      this.#db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      return true;
+    } catch { return false; }
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
+    // Fold the WAL before the handle goes away, so the file left on disk stands
+    // alone (see `checkpoint`). A failure here is housekeeping, never a close
+    // failure: the ledger's content is committed either way.
+    this.checkpoint();
     try {
+      // VACUUM only after the checkpoint: it rewrites the main file, and a WAL
+      // that still held a read mark would only grow again right after.
+      // Housekeeping like the checkpoint, so a refusal is not a close failure.
+      try { this.#db.exec("VACUUM"); } catch { /* best-effort compaction */ }
       this.#db.close();
       this.#closed = true;
     } catch (error) { throw storageError(error, "Cannot close trash ledger"); }
