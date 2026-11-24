@@ -101,6 +101,10 @@ export const RIG_PLUGIN_CONFIG_KEYS = Object.freeze([
   // contract could silently measure another grammar (ADR-0056 makes `nokeepall`
   // the mount's shipped default).
   'pruneAskGrammar',
+  // The `/cremate gc` sweep's retain count. A scenario that states a sweep must
+  // reach the mount unchanged, or the rig would report the resolver's default
+  // (0 — no sweep) while claiming a directory was collected.
+  'gcRetainSessions',
   // ISSUE-022 chunks 5–6; ADR-0050 decision 2: the trigger's denominator, the
   // absolute bar that supersedes it, and the native-compaction backstop. All
   // three are the entry's own config, so a scenario that states a bar must

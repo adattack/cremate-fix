@@ -25,5 +25,9 @@
         barBytes: 512
         enforcement: apply
         pruneThresholdTokens: 60000
+        # `/cremate gc` keeps this many recent sessions and removes the rest.
+        # Storage never expires on its own, so a sweep is the only way to bound
+        # it; 0 (the resolver's default) means a sweep removes nothing.
+        gcRetainSessions: 20
         entryAskTrigger: { mode: 'off' }
         nativeCompactionBackstop: true

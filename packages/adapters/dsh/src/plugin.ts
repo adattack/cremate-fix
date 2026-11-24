@@ -99,7 +99,12 @@ export {
 export type {
   RacoonsStorageErrorCode, RacoonsStorageOptions, ResolvedRacoonsStorage,
 } from './storage.js';
+import { join } from 'node:path';
+
 import { DshHostIncompatibleError, probeEvent, probeHost } from './host-compat.js';
+import type { CremateMaintenance } from './cremate-command.js';
+import { collectGarbage, exportRecall } from './storage-maintenance.js';
+import { formatUsageReport, summarizeUsage } from './usage-stats.js';
 
 /** Stable Cordis plugin name. */
 export const CREMATOR_PLUGIN_NAME = 'cremator';
@@ -205,6 +210,16 @@ export interface RacoonsPluginConfig {
    * `protocol.dedupe.classes.callEcho`.
    */
   readonly dedupeCallEcho?: boolean;
+  /**
+   * How many recent sessions `/cremate gc` keeps.
+   *
+   * Storage never expires on its own (ADR-0013: archived bytes live until the
+   * session directory is deleted), so an install otherwise only grows. The
+   * sweep keeps the N most recently used sessions and removes the rest; a
+   * session a live mount holds is always kept. `0` removes nothing (the
+   * default: a sweep is an explicit act), `1` keeps only the newest.
+   */
+  readonly gcRetainSessions?: number;
   /**
    * What fires the batched entry ask (ISSUE-128; ADR-0050 decision 4). Absent
    * is `off`: the product configuration sends no entry ask. An explicit `count`
@@ -353,6 +368,8 @@ export interface ResolvedRacoonsConfig {
    * backstop stays armed and racoons fires earlier than the host's own trigger.
    */
   readonly nativeCompactionBackstop: boolean;
+  /** How many recent sessions a `/cremate gc` sweep keeps; 0 disables sweeps. */
+  readonly gcRetainSessions: number;
   /**
    * The flat floor knob, before the per-session resolution; null means "let the
    * per-model table decide" (ADR-0020 Decision 3). The model id lives on the
@@ -927,6 +944,11 @@ export interface RacoonsMount {
    */
   beginCremate(sessionId: string, messageId: string,
     commandId: string | undefined): CremateWait | null;
+  /**
+   * The operator lanes behind `/cremate gc | stats | export`, or null when this
+   * mount has no durable storage to answer them from (an in-memory session).
+   */
+  readonly maintenance: CremateMaintenance | null;
   /** Bind a command request to the host turn that claimed its marker. */
   claimCremate(sessionId: string, messageId: string, turn: number): void;
   /** Drop one command request by name; its waiter reports the failure. */
@@ -1234,13 +1256,19 @@ export function resolvePluginConfig(raw: RacoonsPluginConfig | undefined,
   if (typeof dedupeCallEcho !== 'boolean') {
     throw new Error('cremator: dedupeCallEcho must be a boolean');
   }
+  // The sweep's retain count. Absent is 0 — no sweep ever runs on its own,
+  // because deleting a session's archive is only ever an explicit act.
+  const gcRetainSessions = config.gcRetainSessions ?? 0;
+  if (!isCount(gcRetainSessions)) {
+    throw new Error('cremator: gcRetainSessions must be a non-negative safe integer');
+  }
   return Object.freeze({
     episodeNoNewPathSteps, sealMaxLatencyTurns, barBytes,
     minCutFreedBytes, enforcement, recordName,
     anchors, judgeTimeoutMs, crematorStorageRoot, contextWindowTokens,
     pruneThresholdTokens, nativeCompactionBackstop,
     floorBytes, entryAskBatchSize, dedupeSupersededByReread, dedupeCallEcho,
-    entryAskTrigger, entryAskGrammar, pruneAskGrammar,
+    entryAskTrigger, entryAskGrammar, pruneAskGrammar, gcRetainSessions,
   });
 }
 
@@ -1915,10 +1943,34 @@ export function createRacoonsMount(options: {
   }
   const clock: Clock = options.clock ?? { nowMs: () => Date.now() };
   const emit = options.journal ?? (() => {});
+  /**
+   * The records `/cremate stats` totals.
+   *
+   * The journal sink is write-only by contract: a host supplies a function and
+   * the mount hands it lines. Nothing read them back, so the two facts an
+   * operator needs — what an ask cost and what a pass freed — were reachable
+   * only by opening SQLite. Keeping the two accounting kinds here (and only
+   * those: a per-session ring, bounded, so a long-lived mount cannot grow
+   * without limit) lets the command answer without a second storage path.
+   *
+   * The ring is not a substitute for the journal: a sink remains the record.
+   * It is the in-process rollup the command card reads.
+   */
+  const accountingKinds = new Set<RacoonsJournalKind>(['prune-ask', 'prune-apply']);
+  const accountingRing: RacoonsJournalRecord[] = [];
+  const ACCOUNTING_RING_LIMIT = 2048;
   const journal = (kind: RacoonsJournalKind, fields: Record<string, unknown>): void => {
+    let record: RacoonsJournalRecord | null = null;
     try {
-      emit(Object.freeze({ kind, atMs: clock.nowMs(), ...fields }) as RacoonsJournalRecord);
+      record = Object.freeze({ kind, atMs: clock.nowMs(), ...fields }) as RacoonsJournalRecord;
+      emit(record);
     } catch { /* a journal sink must never alter engine outcomes */ }
+    if (accountingKinds.has(kind)) {
+      // Recorded even when the sink threw: the cost was still paid.
+      const entry = record ?? Object.freeze({ kind, atMs: clock.nowMs(), ...fields }) as RacoonsJournalRecord;
+      accountingRing.push(entry);
+      if (accountingRing.length > ACCOUNTING_RING_LIMIT) accountingRing.shift();
+    }
   };
   /**
    * The host's warning channel, guarded (ISSUE-429): a throwing `warn` sink is
@@ -5634,8 +5686,40 @@ export function createRacoonsMount(options: {
     return work;
   }
 
+  /**
+   * The operator lanes `/cremate gc | stats | export` answer from.
+   *
+   * Kept on the mount rather than in the command so the command stays
+   * storage-free: a mount with no durable root (a test, an in-memory session)
+   * answers `null` here and the command says the lane is unavailable, instead
+   * of the card pretending a directory was swept.
+   */
+  const maintenance: CremateMaintenance | null = storage.root === undefined ? null : {
+    collectGarbage: () => {
+      // A session this process holds is never swept: its ledger is open, and a
+      // directory removed under a live SQLite handle is not a maintenance act.
+      const sessions = [...targets.keys()];
+      const result = collectGarbage({ root: storage.root, retain: config.gcRetainSessions,
+        liveSessionIds: sessions });
+      journal('storage-gc', { storageRoot: storage.root, retain: config.gcRetainSessions,
+        removed: result.removed.length, kept: result.kept.length, bytesFreed: result.bytesFreed });
+      const removed = result.removed.length === 0
+        ? 'nothing to remove' : `removed ${String(result.removed.length)} session(s), ${String(result.bytesFreed)} bytes`;
+      const keptLive = result.kept.filter(entry => entry.reason === 'live').length;
+      return `Storage sweep: ${removed}; kept ${String(result.kept.length)} (${String(keptLive)} in use).`;
+    },
+    usageReport: () => formatUsageReport(summarizeUsage(accountingRing)),
+    exportSession: async (sessionId) => {
+      const target = join(storage.root ?? '.', `${sessionId}.archive.json`);
+      const written = await exportRecall({ root: storage.root, sessionId, targetPath: target });
+      journal('storage-export', { storageRoot: storage.root, sessionId, targetPath: target,
+        bytes: written.bytes });
+      return `Exported ${sessionId} to ${target} (${String(written.bytes)} bytes).`;
+    },
+  };
+
   return { sessions, counters, observedSessionIds, sessionFor, syncTranscript, observe, requestPrune,
-    beginCremate, claimCremate, cancelCremate, abandonCremateWaits,
+    beginCremate, claimCremate, cancelCremate, abandonCremateWaits, maintenance,
     observeWire,
     // Each public boundary registers its work so a concurrent `endSession`
     // waits it out before releasing (ISSUE-397). Internal calls (the tail
@@ -6521,6 +6605,9 @@ export function createRacoonsPlugin(options: RacoonsPluginOptions = {}): {
               mount.beginCremate(sessionId, messageId, commandId),
             cancel: (sessionId, messageId, message) =>
               mount.cancelCremate(sessionId, messageId, message),
+            // The three operator lanes answer without opening a turn; a mount
+            // with no durable root has none of them, and the card says so.
+            ...mount.maintenance === null ? {} : { maintenance: mount.maintenance },
           }),
         };
         ownedSurface = surface;

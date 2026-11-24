@@ -14,11 +14,14 @@ npm install cremator-dsh
 `@cremator/core` installs as a dependency. Requires Node
 `>=22.13.0 <23.0.0 || >=23.4.0`.
 
-Host: `@deepseek-ai/dsh`, declared as an optional peer with the open range
-`>=0.0.0-0`.
-Tested against `0.2.1-rc.2` and `0.2.2-rc.1`. Any older or newer host resolves
-and is accepted: the adapter never refuses a host by version, so a future dsh
-keeps mounting.
+Host: `@deepseek-ai/dsh`, declared as an optional peer with the range
+`>=0.2.1-rc.2 <0.3.0` — the versions this adapter was tested against. An older
+or newer host still installs (the peer is optional), but the mount no longer
+assumes it is readable: it probes the session and `surfaceOp` shapes at
+`apply` and at every step boundary, and refuses to mount with an error naming
+the field when they do not match. A shape mismatch used to surface minutes
+later as a failed pass rather than as an incompatible host, which named the
+wrong component.
 
 ### Install as a dsh bundle
 
@@ -45,28 +48,32 @@ The mount entry is the subpath export; the package's default entry has no host d
 
 ```yaml
 - insert:
-    - id: racoons-mount
-      name: 'file:///C:/Users/TZhen/Desktop/racoons/packages/adapters/dsh/dist/plugin.js'
-      config:
-        barBytes: 512
-        enforcement: apply
-        contextWindowTokens: 400000
-        pruneThresholdTokens: 60000
-        entryAskTrigger: { mode: 'off' }
-        entryAskGrammar: jsonl-20
-        nativeCompactionBackstop: true
+ - id: cremator
+ name: 'cremator-dsh/plugin'
+ config:
+ barBytes: 512
+ enforcement: apply
+ pruneThresholdTokens: 60000
+ entryAskTrigger: { mode: 'off' }
+ entryAskGrammar: jsonl-20
+ nativeCompactionBackstop: true
 ```
 
 The entry is a Cordis plugin (`name`, `inject`, `apply`) and also exports a default instance, so a
-`file:///` specifier or a bare package specifier both work. The example URL is for the
-`C:\Users\TZhen\` device; on the other use
-`file:///C:/Users/TZ/Desktop/racoons/packages/adapters/dsh/dist/plugin.js`. Config keys are the
-mount's flat knobs:
+`file:///` specifier or a bare package specifier both work. Config keys are the mount's flat knobs:
 `barBytes`, `floorBytes`, `episodeNoNewPathSteps`, `sealMaxLatencyTurns`, `minCutFreedBytes`,
 `enforcement`, `recordName`, `anchors`, `judgeTimeoutMs`, `crematorStorageRoot`,
 `contextWindowTokens`, `pruneThresholdTokens`, `nativeCompactionBackstop`, `entryAskTrigger`,
 `entryAskGrammar`, `pruneAskGrammar`, `entryAskBatchSize`, `dedupeSupersededByReread`,
-`dedupeCallEcho`.
+`dedupeCallEcho`, `gcRetainSessions`.
+
+`contextWindowTokens` is deliberately absent above. The depth trigger's skip
+line is 75% of that number, so a fixed value is wrong for every routed model but
+the one it was measured on: too small retires the trigger early (400,000 on a
+1M-token model stops at 300,000), too large retires it never. Left unset, the
+mount resolves the **routed model's** own window through the host's
+`llm.resolveModelInfo` seam and re-resolves on a model switch. Set it only when
+you want to pin a number regardless of the route.
 
 ### The `/cremate` command
 
@@ -77,38 +84,37 @@ the pass the turn's `agent/pre-step` runs inside the open turn. The marker step 
 so the model sees no `/cremate` message and the turn sends no request; the marker carries the
 command's id as `source.commandId`. The pass must run inside a turn because the host's session log
 accepts a tool-result surface replacement only with an open turn; running it from the handler
-corrupts the stored session (ISSUE-535). A typed `/cremate` message keeps its queued path: it marks
+corrupts the stored session. A typed `/cremate` message keeps its queued path: it marks
 the session and the next `agent/pre-step` runs the pass.
 
-Defaults that matter: `barBytes` 512 (ADR-0051), `enforcement` `apply` (ADR-0008; `record-only` is
-the explicit opt-out), `entryAskGrammar` `jsonl-20`, `pruneAskGrammar` `nokeepall` (ADR-0056), and
+Defaults that matter: `barBytes` 512, `enforcement` `apply`, `entryAskGrammar` `jsonl-20`, `pruneAskGrammar` `nokeepall`, and
 `nativeCompactionBackstop` `true`. `contextWindowTokens` is the host window the apply leg plans
-against; `pruneThresholdTokens` is the absolute depth bar (test value 60,000) and requires the window.
-`entryAskTrigger` defaults to `{ mode: "off" }`: the per-result entry ask is retired (ADR-0050), and
+against; `pruneThresholdTokens` is the absolute depth bar (the example uses 60,000); it requires a
+window, configured or resolved from the host.
+`entryAskTrigger` defaults to `{ mode: "off" }`: the per-result entry ask is retired, and
 the entry seam stays for compatibility. An explicit `{ mode: "count" }` selects the retired
 per-result cadence; `entryAskBatchSize` applies only on that path.
 
-`capBytes` and `capHeadBytes` are accepted and ignored since 2026-10-23: ADR-0014 scrapped the
-entry-time cap, so an old config file still mounts and neither value is read. Remove them from new
-rows. `minCutFreedBytes` is also accepted and ignored: the cut is the earliest forgotten node
-(ADR-0034).
+`capBytes` and `capHeadBytes` are accepted and ignored: the entry-time cap was
+scrapped, so an old config file still mounts and neither value is read. Remove them from new
+rows. `minCutFreedBytes` is also accepted and ignored: the cut is the earliest forgotten node.
 
 ## Durable storage
 
-Storage is durable per session (ADR-0013): session `N`'s trash ledger is
+Storage is durable per session: session `N`'s trash ledger is
 `<crematorStorageRoot>/sessions/N/ledger.sqlite` with its blobs in the sibling `blobs/`
-directory. Removals survive a restart via the durable ledger (ADR-0015); a host-confirmed
+directory. Removals survive a restart via the durable ledger; a host-confirmed
 conflict blocks and journals.
 
 Only the storage root is configurable; a per-session path pair (`databasePath` + `blobRoot`) is
 refused with `explicit-storage-paths`, because one shared ledger would break the per-session rule.
 
 `crematorStorageRoot` is the config key. It must be absolute. Absent, it resolves to
-`<DSH_HOME>/storages/cremator`, where `DSH_HOME` defaults to `~/.dsh`:
-`C:\Users\TZhen\.dsh\storages\CREMATOR` on one owner device, `C:\Users\TZ\.dsh\storages\CREMATOR`
-on the other. `storages` is dsh's own storage root; `CREMATOR` is a subdirectory, so no dsh file
-is ever shared — CREMATOR stamps its own `application_id` and `user_version`, and a shared file
-would be unreadable by both sides.
+`<DSH_HOME>/storages/cremator`, where `DSH_HOME` defaults to `~/.dsh` — so on a typical install
+that is `~/.dsh/storages/cremator`, holding one `sessions/<sessionId>/` directory per session.
+`storages` is dsh's own storage root and `cremator` is a subdirectory of it, so no dsh file is
+ever shared: CREMATOR stamps its own `application_id` and `user_version`, and a shared file would
+be unreadable by both sides.
 
 A host that owns durable storage may pass its own `openLedger` instead:
 
@@ -116,16 +122,35 @@ A host that owns durable storage may pass its own `openLedger` instead:
 import { createRacoonsPlugin } from 'cremator-dsh';
 
 const plugin = createRacoonsPlugin({
-  config: { enforcement: 'apply', barBytes: 512,
-    crematorStorageRoot: 'C:/Users/TZhen/.dsh/storages/cremator' },
-  journal: (record) => console.error(record.kind),
+ config: { enforcement: 'apply', barBytes: 512,
+ crematorStorageRoot: '/home/me/.dsh/storages/cremator' },
+ journal: (record) => console.error(record.kind),
 });
 // mount: await plugin.apply(ctx)
 ```
 
 The mount journals one `mounted` record carrying `ledgerSource`
 (`'durable' | 'host' | 'memory'`), `node` (`process.version`) and, for the durable source,
-`storageRoot` — the runtime evidence ADR-0013 ruling 8 asks for.
+`storageRoot`.
+
+### Operator commands
+
+`/cremate` alone runs a pass. Three subcommands answer without opening a turn,
+because none of them writes the surface:
+
+| Command | What it does |
+| --- | --- |
+| `/cremate` | Run one cremation pass now. |
+| `/cremate stats` | Total what the journal recorded: asks sent, tokens billed, bytes freed, and the net. |
+| `/cremate gc` | Keep the `gcRetainSessions` most recently used sessions and remove the rest. A session a live mount holds is always kept; `0` (the default) removes nothing. |
+| `/cremate export <sessionId>` | Write that session's archive to `<crematorStorageRoot>/<sessionId>.archive.json`, ready for `hydrate` on another device. |
+
+Storage never expires on its own — archived bytes live until the session
+directory is deleted — so `/cremate gc` is the only thing that bounds an
+install's footprint. `/cremate stats` reads the same two journal records a sink
+already receives (`prune-ask` for cost, `prune-apply` for freed bytes): an ask
+that reported no usage is counted as an ask with an UNKNOWN cost, never as a
+free one, and a pass that did not apply freed nothing.
 
 `':memory:'` is for tests only, through the programmatic `storage` option; no config value
 selects it.
@@ -133,21 +158,21 @@ selects it.
 ### Degradation
 
 - **The ledger cannot open** (the path is unreadable, occupied, or otherwise failing): the mount retries
-  the open once at the next step boundary, warning and journaling `storage-retry` for the first
-  failure. If the retry also fails, it installs a refusing ledger and journals `storage-unavailable`
-  once with the code, path and runtime; every removal is then refused with a typed `storage` error.
-  The session degrades to `recovery-pending`, the transcript is never touched, and recall of ids this
-  process never minted fails as `not-found`. A retry that succeeds journals `storage-recovered` and
-  the mount is fully live.
+ the open once at the next step boundary, warning and journaling `storage-retry` for the first
+ failure. If the retry also fails, it installs a refusing ledger and journals `storage-unavailable`
+ once with the code, path and runtime; every removal is then refused with a typed `storage` error.
+ The session degrades to `recovery-pending`, the transcript is never touched, and recall of ids this
+ process never minted fails as `not-found`. A retry that succeeds journals `storage-recovered` and
+ the mount is fully live.
 - **A restart keeps removals live.** The durable ledger's `applied` receipts are the record of
-  record (ADR-0015): a fresh port answers `unknown` for an intent it never saw, and the removal
-  still counts as applied. A host that positively answers `not-applied` contradicts the ledger:
-  the pass blocks and journals a `receipt-conflict`. Recall is a read of the durable ledger and
-  keeps working either way.
+ record: a fresh port answers `unknown` for an intent it never saw, and the removal
+ still counts as applied. A host that positively answers `not-applied` contradicts the ledger:
+ the pass blocks and journals a `receipt-conflict`. Recall is a read of the durable ledger and
+ keeps working either way.
 - **Retention.** Archived bytes live until the user deletes the session directory. There is no
-  automatic deletion and no expiry in v1.
+ automatic deletion and no expiry in v1.
 - **Scope.** A recall id resolves within the session that minted it, including after a restart or
-  resume of that session. Cross-session recall is out of scope (ADR-0013 ruling 7).
+ resume of that session. Cross-session recall is out of scope.
 
 The `necromancy` model-facing tool returns the projected output (`recallId`, `text`, `byteLength`,
 `parts`), never the ledger record's `Uint8Array` parts: dsh requires every tool value to be
@@ -156,11 +181,9 @@ admitted request at its next step or turn-end boundary, as one revert plus one r
 
 ## Status
 
-Append-mode Seal is enforced; the entry-time cap is scrapped (ADR-0014, 2026-10-23). Verdict
-enforcement defaults to `apply` (ADR-0008); `record-only` is the explicit opt-out. The
-stale-read and superseded-read proof rules ship and run in the mount's at-rest pass (ISSUE-045
-C3). Per-call usage reconciliation from the host's `assistant/message` row is wired (ISSUE-045
-D1). The per-path coverage meter's rows ride `SessionSnapshot.pathCoverage`, and the recall
+Append-mode Seal is enforced; the entry-time cap is scrapped. Verdict
+enforcement defaults to `apply`; `record-only` is the explicit opt-out. The
+stale-read and superseded-read proof rules ship and run in the mount's at-rest pass. Per-call usage reconciliation from the host's `assistant/message` row is wired. The per-path coverage meter's rows ride `SessionSnapshot.pathCoverage`, and the recall
 source-fallback reader is wired (`recallReader`, `recallFromSource`).
 
 ## License

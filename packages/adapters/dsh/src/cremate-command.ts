@@ -44,8 +44,17 @@ export const CREMATE_TURN_TEXT = 'cremator: cremate';
 export const CREMATE_NO_SESSION =
   'Could not find this chat. Run /cremate from a live session.';
 
-/** The refusal when the invocation carries any text after `/cremate`. */
-const CREMATE_USAGE_TEXT = 'Use /cremate with no extra text.';
+/**
+ * The refusal when the invocation carries a subcommand this command does not
+ * know.
+ *
+ * `/cremate` itself takes no argument and still runs a pass; the three
+ * subcommands are operator lanes, not passes, so they never open a turn. An
+ * unrecognised word is a usage mistake rather than a pass, which is what keeps
+ * a typo from spending an ask.
+ */
+const CREMATE_USAGE_TEXT =
+  'Use /cremate with no argument (run a pass), or /cremate gc | stats | export <sessionId>.';
 
 /** The card when another cremate request is pending or its pass is running. */
 const CREMATE_BUSY_TEXT = 'A cremation pass is already running in this chat.';
@@ -125,6 +134,15 @@ export interface CremateMarker {
   readonly commandId?: string;
 }
 
+/**
+ * The operator subcommands `/cremate` answers without opening a turn.
+ *
+ * They are storage and accounting lanes: none of them writes the surface, so
+ * none of them needs the marker turn a pass needs (which exists only because a
+ * `tool/result` replacement is refused outside an open turn).
+ */
+export type CremateSubcommand = 'gc' | 'stats' | 'export';
+
 export interface CremateCommandOptions {
   /**
    * Register this command invocation's pass request and return its waiter.
@@ -136,6 +154,46 @@ export interface CremateCommandOptions {
     CremateWait | null;
   /** Drop the request when the turn could not be opened or was cancelled. */
   cancel(sessionId: string, messageId: string, message: string): void;
+  /**
+   * The operator subcommands, when the mount has the storage to answer them.
+   *
+   * Absent means the mount cannot answer that lane at all (an in-memory mount
+   * has no session directory to collect or export, and a mount with no journal
+   * sink has nothing to total), so the card says so instead of pretending.
+   */
+  readonly maintenance?: CremateMaintenance;
+}
+
+/** The three operator lanes, injected by the mount that owns the storage. */
+export interface CremateMaintenance {
+  /** Keep the newest N sessions, remove the rest. Answers the card text. */
+  collectGarbage(): string;
+  /** Total what the journal recorded. */
+  usageReport(): string;
+  /** Write one session's archive to `targetPath`-convention output. */
+  exportSession(sessionId: string): Promise<string>;
+}
+
+/**
+ * Split `/cremate`'s raw input into a subcommand and its one argument.
+ *
+ * Empty input is the pass (no subcommand). A recognised word is that lane; a
+ * missing or extra argument is refused by the caller, never defaulted.
+ */
+export function cremateSubcommandOf(rawInput: string | undefined):
+  { readonly kind: 'pass' }
+  | { readonly kind: 'maintenance'; readonly command: CremateSubcommand; readonly argument: string }
+  | { readonly kind: 'usage' } {
+  const words = (rawInput ?? '').trim().split(/\s+/u).filter(word => word.length > 0);
+  if (words.length === 0) return { kind: 'pass' };
+  const [first, ...rest] = words;
+  if (first === 'gc' || first === 'stats') {
+    return rest.length === 0 ? { kind: 'maintenance', command: first, argument: '' } : { kind: 'usage' };
+  }
+  if (first === 'export') {
+    return rest.length === 1 ? { kind: 'maintenance', command: 'export', argument: rest[0]! } : { kind: 'usage' };
+  }
+  return { kind: 'usage' };
 }
 
 /** A unique-enough message id for the turn the command opens. */
@@ -199,10 +257,26 @@ export function createCremateCommand(options: CremateCommandOptions): DshCommand
     name: CREMATE_COMMAND_NAME,
     description: CREMATE_COMMAND_DESCRIPTION,
     async handler(invocation) {
-      // `/cremate` takes no arguments (ISSUE-545): any text after it is a
-      // usage mistake, rejected before a session lookup, a request or a turn.
-      if ((invocation.rawInput ?? '').trim().length > 0) {
+      // `/cremate` alone runs a pass; the three subcommands are operator lanes
+      // that never open a turn (they write no surface). Anything else is a usage
+      // mistake, rejected before a session lookup, a request or a turn.
+      const parsed = cremateSubcommandOf(invocation.rawInput);
+      if (parsed.kind === 'usage') {
         return { kind: 'error', text: CREMATE_USAGE_TEXT };
+      }
+      if (parsed.kind === 'maintenance') {
+        const maintenance = options.maintenance;
+        if (maintenance === undefined) {
+          return { kind: 'error',
+            text: `/cremate ${parsed.command} is unavailable on this mount: it has no storage to read.` };
+        }
+        try {
+          if (parsed.command === 'gc') return { kind: 'success', text: maintenance.collectGarbage() };
+          if (parsed.command === 'stats') return { kind: 'success', text: maintenance.usageReport() };
+          return { kind: 'success', text: await maintenance.exportSession(parsed.argument) };
+        } catch (error) {
+          return { kind: 'error', text: `${CREMATE_FAILED_PREFIX}${messageOf(error)}` };
+        }
       }
       const session = invocation.agent?.session;
       if (session === undefined) {

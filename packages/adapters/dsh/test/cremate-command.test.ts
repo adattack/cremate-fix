@@ -76,11 +76,20 @@ test('the /cremate command rejects extra text before opening anything', async ()
     session: fakeSession('session-usage'),
     followup: (message: unknown) => { followups.push(message); },
   };
+  const usageText = 'Use /cremate with no argument (run a pass), or /cremate gc | stats | export <sessionId>.';
   assert.deepEqual(await command.handler({ rawInput: ' please ', agent }),
-    { kind: 'error', text: 'Use /cremate with no extra text.' });
+    { kind: 'error', text: usageText });
   assert.deepEqual(await command.handler({ rawInput: 'please' }),
-    { kind: 'error', text: 'Use /cremate with no extra text.' },
+    { kind: 'error', text: usageText },
     'the usage card wins over the no-session card');
+  // An operator lane is a word, not arbitrary text: a typo, a bad argument
+  // count and an extra word on a no-argument lane are all refused here, before
+  // any session lookup or turn. A typo must never be read as a pass and spend
+  // an ask.
+  for (const rawInput of ['gc now', 'stats all', 'export', 'export a b', 'cremate']) {
+    assert.deepEqual(await command.handler({ rawInput, agent }),
+      { kind: 'error', text: usageText }, `${rawInput} is a usage mistake`);
+  }
   assert.equal(begins.length, 0, 'no request is recorded');
   assert.equal(followups.length, 0, 'no turn is opened');
   assert.equal(cancels.length, 0, 'nothing was recorded, so nothing is dropped');

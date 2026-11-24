@@ -69,6 +69,10 @@ export const CREMATOR_JOURNAL_KINDS = [
   // (ISSUE-336): one line naming the restored post-pass baseline
   'prune-trigger-resumed',
   'prune-apply', 'prune-apply-error', 'prune-apply-skipped',
+  // the operator lanes `/cremate gc` and `/cremate export` (ADR-0013 storage):
+  // one line per sweep and per archive write, carrying what it touched. Neither
+  // is a pass: they never open a turn and never write the surface.
+  'storage-gc', 'storage-export',
   // the host's own compaction, observed never touched (ISSUE-029)
   'native-compaction',
   // per-request token accounting (G8, ISSUE-045 D1): a reconciled reading, and
