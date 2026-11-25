@@ -2,6 +2,17 @@
 
 Compaction Reinvented, Erase Meaningless Agent Token Overhead Reversibly.
 
+> **This repository is a fork.** It is not the upstream project.
+>
+> - Original project: **[zman406986/Agent-Memory-CREMATOR](https://github.com/zman406986/Agent-Memory-CREMATOR)**
+> - This fork: [adattack/cremate-fix](https://github.com/adattack/cremate-fix)
+>
+> It carries the upstream source at v0.1.2 plus a set of fixes and additions
+> (listed under [Changes in this fork](#changes-in-this-fork) below). The
+> upstream packages on npm are unmodified: installing `cremator-dsh` from npm
+> gets the upstream release, not this fork. Everything below the changelog is
+> the upstream documentation, kept as it was.
+
 Early stage. The packages are on npm. Install the adapter you use. The `examples/core-offline/` example runs end to end without dsh. The core and the dsh adapter have
 been run against real dsh. The OpenCode adapter passes functional tests against a fake host only;
 its live-run evidence is withdrawn (see [its README](packages/adapters/opencode/README.md)). This
@@ -13,6 +24,80 @@ dead or marked forgotten and leaves a short record — a negative fact for a fai
 than rewriting history into summaries.
 
 [English](README.md) · [中文](README.zh-CN.md)
+
+## Changes in this fork
+
+Against upstream v0.1.2 (`c8f1136`). Each item names what was wrong and how it
+is verified; nothing outside this list was changed.
+
+**Fixes**
+
+- **A re-published slot keeps the ordinal of the place it occupies.**
+  dsh re-publishes the system prompt every turn via
+  `surfaceOp: {op:'replace', …}`, and that event carries its own
+  `(turn, step)` while it still sits in the transcript's first slot. The fold
+  read the event's own pair first, so the walk went backwards (`2:2` then
+  `1:1`) and core refused every plan built on that snapshot with
+  `adjacency-changed` — surfacing as `Cremation failed: prune apply rejected:
+  adjacency-changed`. Now the slot decides and the event's own pair is the
+  fallback. Verified against two real failing sessions (3,617 and 7,870
+  events): ordinal walk monotone, core transcript check clean.
+- **The ledger file stands alone after `close()`.**
+  `SqliteLedger.close()` now runs `PRAGMA wal_checkpoint(TRUNCATE)` before
+  `db.close()` (and `VACUUM` after). Without it the main file is a 4 KiB shell
+  whose schema and rows live in `-wal`, so a backup that copies
+  `ledger.sqlite` alone reads "no such table" and every recall id silently
+  fails. A checkpoint failure never fails the close. `checkpoint()` is public,
+  for a caller about to export or copy.
+- **The dependency floor matches the build.**
+  `cremator-dsh@0.1.2` imported `isTwoVerdictGrammar` from `@cremator/core`
+  while declaring `"^0.1.0"`; a fresh install resolved 0.1.1, which has no such
+  export, and the plugin died at ESM link time on load. The floor is now
+  `^0.1.2`, and a startup test builds both packages and imports them through
+  their published entry points so this cannot ship again.
+- **The host is probed, not assumed.** `peerDependencies` says
+  `>=0.2.1-rc.2 <0.3.0` instead of the open `>=0.0.0-0`, and `apply()` /
+  each step boundary check the `session` and `surfaceOp` shapes, refusing to
+  mount with an error naming the field. A shape mismatch used to stay invisible
+  until a pass failed with a verdict about the plan.
+
+**Configuration**
+
+- The shipped bundle no longer pins `contextWindowTokens: 400000`. The depth
+  trigger's skip line is 75% of that number, so a fixed value is wrong for
+  every routed model but the one it was measured on — 400,000 on a 1M-token
+  model retires the trigger at 300,000 and leaves 700,000 unused. Left unset,
+  the mount resolves the routed model's own window through the host's
+  `llm.resolveModelInfo` seam.
+
+**Performance**
+
+- `surfaceTranscript` folds only the log tail. It carries `ordinalAt`,
+  `stepAt`, the call facts, the running ordinals and the finished item per
+  surface position, so a boundary re-reads only new log positions and reuses
+  the items it already built. On a 9,600-event / 4,000-node session: 3.35 ms
+  cold → 0.54 ms for a one-result tail (6.2x). A `beforeSeq` cut bypasses the
+  carry; a log that shrank restarts the walk.
+- `port.setTranscript` adopts the projection instead of deep-cloning all of it
+  (4.98 ms → 0.001 ms at 1,707 items).
+- One redundant `syncPass` per step boundary was dropped.
+
+**New operator lanes**
+
+- `/cremate gc` — keep the `gcRetainSessions` most recently active sessions and
+  remove the rest. A session a live mount holds is always kept. Storage
+  otherwise never expires: archived bytes live until the directory is deleted.
+- `/cremate export <sessionId>` — write that session's archive
+  (core's own `LedgerArchive.bytes`, the same bytes `hydrate` reads) to
+  `<crematorStorageRoot>/<sessionId>.archive.json`.
+- `/cremate stats` — total what the journal already recorded: asks sent, tokens
+  billed, bytes freed, and the net. An ask that reported no usage counts as an
+  ask with an unknown cost, never a free one.
+
+**Documentation**
+
+- The shipped READMEs no longer carry development-machine paths or internal
+  ticket numbers.
 
 ## Why
 
@@ -176,7 +261,7 @@ Install with `npm install cremator-dsh` or `npm install cremator-opencode`;
 ## Publishing
 
 Publish in dependency order: `@cremator/core@0.1.2` first, then `cremator-dsh@0.1.2` and
-`cremator-opencode@0.1.2`. Both adapters declare `"@cremator/core": "^0.1.0"`, so the core release
+`cremator-opencode@0.1.2`. Both adapters declare `"@cremator/core": "^0.1.2"`, so the core release
 must exist on the registry before either adapter tarball can install.
 
 ## License

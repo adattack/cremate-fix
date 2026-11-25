@@ -1,5 +1,10 @@
 # cremator-dsh
 
+> **Fork notice.** This package's source in this repository is a fork of
+> [zman406986/Agent-Memory-CREMATOR](https://github.com/zman406986/Agent-Memory-CREMATOR);
+> see the [repository README](../../README.md) for the full change list. The
+> version published to npm is the upstream release, not this fork.
+
 CREMATOR adapter for the dsh harness. Thin seam mapping, no policy: it translates dsh session
 events into the public seams of `@cremator/core` and applies what the core guard approved. Every
 removal is recorded in the trash ledger under a recall id. Project:

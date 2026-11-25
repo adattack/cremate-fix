@@ -2,6 +2,15 @@
 
 Compaction Reinvented, Erase Meaningless Agent Token Overhead Reversibly.
 
+> **本仓库是 fork，不是上游项目。**
+>
+> - 原项目：**[zman406986/Agent-Memory-CREMATOR](https://github.com/zman406986/Agent-Memory-CREMATOR)**
+> - 本 fork：[adattack/cremate-fix](https://github.com/adattack/cremate-fix)
+>
+> 内容取自上游 v0.1.2 的源码，另加了一批修复与新增（见下文「本 fork 的改动」）。
+> npm 上的上游包未做任何改动：从 npm 安装 `cremator-dsh` 拿到的是上游发布版，不是本 fork。
+> 改动清单之后的正文均为上游文档，保持原样。
+
 CREMATOR 是一个 TypeScript 库，专门给编码智能体的上下文做减法。常见的压缩都等窗口快满了才动手：让模型把历史重写成一篇摘要，或者把最旧的消息截掉。CREMATOR 反着来，趁内容还新鲜就删掉那些已经没用的工具结果，原地只留一条短回执。删掉的字节全部记进账本，凭召回 id 随时逐字节还原。
 
 项目还在早期。三个包都已发布到 npm：安装 `cremator-dsh` 或 `cremator-opencode`，`@cremator/core` 会作为依赖自动装好。core 和 dsh 适配器在真实 dsh 会话里跑过，离线示例能端到端跑通。OpenCode 适配器目前只有针对假宿主的功能测试，真实运行的证据已经撤回，接入前先读 [OpenCode README](packages/adapters/opencode/README.md)。这个库对回答质量的影响还没有得到证实。
@@ -9,6 +18,66 @@ CREMATOR 是一个 TypeScript 库，专门给编码智能体的上下文做减�
 [English](README.md) · [中文](README.zh-CN.md)
 
 ---
+
+## 本 fork 的改动
+
+相对上游 v0.1.2（`c8f1136`）。逐条写明原来错在哪、怎么验证；此清单之外没有改动。
+
+**修复**
+
+- **被替换的槽位保留它所占位置的序号。** dsh 每轮通过
+  `surfaceOp: {op:'replace', …}` 重新发布 system 提示，该事件自带
+  `(turn, step)`，却仍占用对话的第一个槽位。原先的折叠先读事件自带的序号，
+  于是遍历倒退（`2:2` 之后是 `1:1`），core 拒绝该快照上的所有计划，报
+  `adjacency-changed`，表现为 `Cremation failed: prune apply rejected:
+  adjacency-changed`。现在由槽位决定，事件自带序号降为兜底。已在两个真实故障
+  会话（3,617 与 7,870 事件）上验证：序号单调、core 的对话校验通过。
+- **`close()` 之后账本文件可独立使用。** `SqliteLedger.close()` 在
+  `db.close()` 之前执行 `PRAGMA wal_checkpoint(TRUNCATE)`（随后 `VACUUM`）。
+  没有这一步时主文件只是 4 KiB 的空壳，schema 与数据都在 `-wal` 里；只备份
+  `ledger.sqlite` 会读到 "no such table"，所有召回 id 静默失效。检查点失败
+  不会让关闭失败。`checkpoint()` 是公开方法，供导出或复制前调用。
+- **依赖下限与构建一致。** `cremator-dsh@0.1.2` 用到了
+  `@cremator/core` 的 `isTwoVerdictGrammar`，却声明 `"^0.1.0"`；新装环境
+  解析到 0.1.1，该版本没有这个导出，插件在 ESM 链接阶段就挂。下限已改为
+  `^0.1.2`，并新增启动测试：构建两个包、通过发布入口 import，此类问题不会再
+  发出去。
+- **宿主靠探测，不靠假定。** `peerDependencies` 从 `>=0.0.0-0` 收紧到
+  `>=0.2.1-rc.2 <0.3.0`，且 `apply()` 与每次 step 边界会校验 `session` 与
+  `surfaceOp` 的形状，不符时拒绝挂载并指明字段。过去这种不符要等到某次 pass
+  失败、拿到一个关于「计划」的裁决才暴露。
+
+**配置**
+
+- 打包配置不再写死 `contextWindowTokens: 400000`。深度触发的停手线是该值的
+  75%，所以固定值只对测量时那个模型正确：在 1M 窗口的模型上配 400,000，
+  会在 300,000 就停手，白白浪费 70 万。不写则通过宿主的
+  `resolveModelInfo` 解析**路由到的模型**自己的窗口。
+
+**性能**
+
+- `surfaceTranscript` 只折叠日志尾部。它携带 `ordinalAt`、`stepAt`、
+  call facts、运行中的序号，以及每个表面位置已完成的 item，因此边界只读新增
+  日志位置并复用已构建的 item。在 9,600 事件 / 4,000 节点上：冷折叠 3.35ms
+  → 单结果尾部读取 0.54ms（6.2 倍）。`beforeSeq` 切割绕过 carry；日志变短
+  则整体重来。
+- `port.setTranscript` 直接接管投影，不再整体深拷贝（1,707 个 item 上
+  4.98ms → 0.001ms）。
+- 去掉了每个 step 边界上一次冗余的 `syncPass`。
+
+**新增运维命令**
+
+- `/cremate gc` —— 保留最近活跃的 `gcRetainSessions` 个会话，其余删除；
+  活跃挂载持有的会话永远保留。存储本身永不过期：归档字节会一直留到目录被删。
+- `/cremate export <sessionId>` —— 把该会话的归档（core 自己的
+  `LedgerArchive.bytes`，与 `hydrate` 读回的同一份字节）写到
+  `<crematorStorageRoot>/<sessionId>.archive.json`。
+- `/cremate stats` —— 汇总 journal 已记录的内容：ask 次数、计费 token、
+  释放字节、净收益。没有 usage 读数的 ask 记为「成本未知」，绝不算作免费。
+
+**文档**
+
+- 发布用的 README 去掉了开发机路径与内部工单编号。
 
 ## 问题在哪
 

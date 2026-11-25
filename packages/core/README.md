@@ -1,5 +1,10 @@
 # @cremator/core
 
+> **Fork notice.** This package's source in this repository is a fork of
+> [zman406986/Agent-Memory-CREMATOR](https://github.com/zman406986/Agent-Memory-CREMATOR);
+> see the [repository README](../../README.md) for the full change list. The
+> version published to npm is the upstream release, not this fork.
+
 Harness-agnostic context hygiene for coding agents. It removes provably useless content from a
 transcript while it is still fresh, records every removal in a trash ledger under a recall id, and
 never summarizes. Deterministic code never judges usefulness and never protects a content class; it
