@@ -13,14 +13,20 @@
  * differently from a cold fold would be a correctness bug wearing a speed-up's
  * clothes.
  *
- * The `replace` block below is a SNAPSHOT of current behaviour, not an
- * endorsement of it. It records one known defect in this revision of the fold;
- * see its header.
+ * The `replace` block below is a REGRESSION suite for one live failure: a
+ * re-published system prompt used to make the ordinal walk go backwards, and
+ * core refused every plan built on it. See that block's header.
  */
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
+import { DEFAULT_CONFIG, Guard } from '@cremator/core';
+import type { TranscriptNode } from '@cremator/core';
+import { toCoreTranscript } from '../src/envelope.js';
+
+/** One core transcript node, as `toCoreTranscript` produces it. */
+type EnvelopeNode = TranscriptNode;
 import { createSurfaceCarry, surfaceTranscript } from '../src/plugin.js';
 
 const decoder = new TextDecoder();
@@ -103,7 +109,7 @@ describe('the surface fold', () => {
   });
 });
 
-describe('surfaceOp REPLACE: snapshot of current behaviour', () => {
+describe('surfaceOp REPLACE keeps the slot it took over', () => {
   /**
    * A re-published slot, stated as dsh states it: `{op:'replace', startSeq,
    * endSeq}` at a LATER seq, while the surface keeps the slot it names.
@@ -140,35 +146,42 @@ describe('surfaceOp REPLACE: snapshot of current behaviour', () => {
   });
 
   /**
-   * KNOWN DEFECT, PINNED — not corrected here.
+   * REGRESSION: a re-published slot keeps the ordinal of the PLACE it occupies.
    *
-   * The fold stamps a re-published slot with the event's OWN `(turn, step)`
-   * before falling back to the position it took over (`ownOrdinal` runs first
-   * in `surfaceTranscript`). The replaced system prompt therefore carries
-   * `2:2` while it still occupies the transcript's FIRST slot, and the next
-   * item carries `1:1` — the walk goes backwards, and core's
-   * `checkTranscript` refuses any plan built on it with
+   * An ordinal is a property of a transcript position, not of the moment a
+   * message was published, and the guard requires the walk to be monotone.
+   * dsh re-publishes the system prompt (the project instructions) every turn,
+   * and that event carries its OWN `(turn, step)` while it still sits in the
+   * transcript's first slot. Reading the event's own pair first stamped `2:2`
+   * on the FIRST item and left `1:1` on the second — the walk went backwards
+   * and every plan built on that snapshot was refused with
    * `adjacency-changed: Node ordinals are invalid or disagree with transcript
-   * order`. On a live dsh session that surfaces as a failed `/cremate`:
+   * order`, which reached the user as
    * `Cremation failed: prune apply rejected: adjacency-changed`.
    *
-   * The fix is a one-line reordering (read `inheritedOrdinal` first, so a
-   * replace keeps the slot's ordinal and `ownOrdinal` stays the fallback for a
-   * node with no replace target). It is NOT applied here because this change
-   * set is scoped to the eight agreed optimisation items, and an ordinal reorder
-   * changes behaviour beyond them. This case exists so the current output is
-   * recorded rather than assumed: fixing the fold must change THIS assertion.
+   * This case is the live failure reproduced on one turn pair. It asserts the
+   * FIXED behaviour: the re-published node reads `1:1`, its own `(2, …)` pair
+   * is not consulted, and the whole walk stays monotone.
    */
-  it('currently stamps the replaced slot with its own (turn, step), which walks backwards', () => {
+  it('keeps the SLOT ordinal on a replaced node, so the walk never walks backwards', () => {
     const { log, nodes } = replaceLog();
     const projected = surfaceTranscript(sessionOf(log, nodes), { sessionId: 'session-fold' });
+    // The replaced node reads the slot's ordinal (1:1), not its own publish pair.
     assert.deepEqual(projected.items.map(item => item.turnOrdinal + ':' + item.stepOrdinal),
-      ['2:2', '1:1', '2:2'],
-      'the middle item is LOWER than the first: the defect this case pins');
-    assert.ok(projected.items[1]!.turnOrdinal < projected.items[0]!.turnOrdinal,
-      'the walk decreases where core requires it never to');
-    // A chain of replaces inherits the same way: the last position wins the
-    // stamp, not the slot the chain started from.
+      ['1:1', '1:1', '2:2'],
+      'a re-published slot keeps the ordinal of the place it took over');
+    // The property the guard actually requires, asserted directly so a future
+    // edit that "restores" the old order fails here by name.
+    let previousTurn = -1;
+    let previousStep = -1;
+    for (const item of projected.items) {
+      assert.ok(item.turnOrdinal >= previousTurn && item.stepOrdinal >= previousStep,
+        'the walk never decreases: this is what checkTranscript refuses on');
+      previousTurn = item.turnOrdinal;
+      previousStep = item.stepOrdinal;
+    }
+    // A chain of replaces inherits transactionally to the position that started
+    // it: the LAST publish carries the FIRST slot's ordinal, not its own.
     const chained: any[] = [
       { type: 'turn/start', seq: 0, data: { turn: 1 } },
       { type: 'step/start', seq: 1, data: { turn: 1, step: 1 } },
@@ -186,8 +199,60 @@ describe('surfaceOp REPLACE: snapshot of current behaviour', () => {
     const chainProjected = surfaceTranscript(sessionOf(chained, [8]), { sessionId: 'session-fold' });
     assert.equal(chainProjected.items.length, 1);
     assert.equal(decoder.decode(chainProjected.items[0]!.bytes), 'v3');
-    assert.equal(chainProjected.items[0]!.turnOrdinal, 3,
-      'the chain is stamped from its LAST publish, not the slot it started from');
+    assert.equal(chainProjected.items[0]!.turnOrdinal, 1,
+      'the chain keeps the ordinal of the slot it started from, whatever re-published it');
+  });
+
+  /**
+   * The other half of the regression: CORE is what refuses the old order, and
+   * this drives its public validation rather than trusting the fold.
+   *
+   * A snapshot whose walk decreases is rejected with `adjacency-changed`,
+   * which is the verdict that reached the user as
+   * `Cremation failed: prune apply rejected: adjacency-changed`. Asserting it
+   * here keeps the two sides agreeing: if core ever relaxed that rule, the case
+   * above would stop being the guarantee its comment claims.
+   */
+  it('core refuses a transcript whose walk decreases, which is why the slot wins', async () => {
+    const { log, nodes } = replaceLog();
+    const projected = surfaceTranscript(sessionOf(log, nodes), { sessionId: 'session-fold' });
+    const envelopes = toCoreTranscript(projected.items);
+    /** Core's own verdict on one node list, with an empty plan set. */
+    const verdict = async (nodesInOrder: readonly EnvelopeNode[]): Promise<string[]> => {
+      // The Guard requires a ledger and a breaker seed; neither is touched by
+      // transcript validation, which runs before any plan is considered.
+      const guard = new Guard({ ledger: undefined as never,
+        initialState: { consecutiveValidationFailures: 0, disabled: false } });
+      const result = await guard.validate({
+        nowMs: 1_700_000_000_000,
+        snapshot: {
+          sessionId: 'session-fold',
+          nodes: nodesInOrder,
+          revision: '0:1',
+          currentTurnOrdinal: projected.currentTurnOrdinal,
+          currentStepOrdinal: projected.currentStepOrdinal,
+          completedThroughTurnOrdinal: projected.completedThroughTurnOrdinal,
+          cache: { kind: 'unknown' },
+          retentionEvidence: [],
+        },
+        plans: [],
+        sealedEpisodeIds: [],
+        input: { kind: 'at-rest', eventId: 'test:at-rest', reason: 'step' },
+        capabilities: { mutateResult: false, rewriteHistory: true, atRest: true,
+          liveTokens: true, log: true, appendRecords: true, rehydrateOnResume: false },
+        config: DEFAULT_CONFIG,
+      }) as { issues?: readonly { code: string }[] };
+      return [...new Set((result.issues ?? []).map(issue => issue.code))];
+    };
+    // The fixed order: what the fold now produces passes core.
+    assert.deepEqual(await verdict(envelopes.map(envelope => envelope.node)), [],
+      "the fixed fold passes core transcript validation");
+    // The OLD order: stamp the replaced node with its own publish pair again.
+    const regressed = envelopes.map(envelope => ({ ...envelope.node })) as EnvelopeNode[];
+    regressed[0] = { ...regressed[0]!, turnOrdinal: projected.currentTurnOrdinal,
+      stepOrdinal: projected.currentStepOrdinal };
+    assert.deepEqual(await verdict(regressed), ['adjacency-changed'],
+      'core refuses exactly this shape: the reason the slot ordinal must win');
   });
 });
 

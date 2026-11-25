@@ -1748,10 +1748,24 @@ export function surfaceTranscript(session: DshMountSession, options: {
     if (event.type === 'tool/call' && typeof data['callId'] === 'string') {
       loggedCalls.set(data['callId'], { name: data['name'], arguments: data['arguments'] });
     }
-    // The log position's ordinal is the fallback, never the rule: a replace's
-    // own pair (or the position it took over) decides what it is stamped with,
-    // and the resolved map makes a chain of replaces inherit transitively.
-    ordinalAt.set(seq, ownOrdinal(event, stepAt) ?? inheritedOrdinal(event, ordinalAt)
+    // The ordinal a REPLACE keeps is the one of the position it took over.
+    //
+    // An ordinal is a property of a PLACE in the transcript, not of the moment
+    // a message was published: the guard (`checkTranscript`) requires the walk
+    // to be monotone, and it is the place -- not the publish -- that has to be
+    // ordered. dsh re-publishes a system prompt every turn (the project
+    // instructions), and that event carries its OWN `(turn, step)` while it
+    // still occupies the transcript's first slot. Reading `ownOrdinal` first
+    // therefore stamped `2:2` on the FIRST item and left `1:1` on the second:
+    // the walk went backwards, and every plan built on it was refused with
+    // `adjacency-changed: Node ordinals are invalid or disagree with transcript
+    // order` -- which reached the user as a failed `/cremate`
+    // (`Cremation failed: prune apply rejected: adjacency-changed`).
+    //
+    // So: the slot a replace took over decides, the resolved map makes a chain
+    // of replaces inherit transitively, and a node with no replace target falls
+    // back to its own pair and only then to the log position.
+    ordinalAt.set(seq, inheritedOrdinal(event, ordinalAt) ?? ownOrdinal(event, stepAt)
       ?? { turn, step: globalStep });
   }
   // The carry now covers the whole grown log; the tables above are final below it.
